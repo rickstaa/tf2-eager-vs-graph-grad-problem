@@ -35,7 +35,7 @@ if RANDOM_SEED is not None:
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # new flag present in tf 2.0+
     np.random.seed(RANDOM_SEED)
     tf.reset_default_graph()
-    tf.random.set_seed(RANDOM_SEED)
+    tf.random.set_random_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
 
 
