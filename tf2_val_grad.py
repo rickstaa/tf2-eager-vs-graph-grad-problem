@@ -510,8 +510,10 @@ if __name__ == "__main__":
     l_delta = tf.reduce_mean(input_tensor=(lya_l_ - l + ALPHA_3 * R))
 
     # Compute actor loss
-    # NOTE: Scale by 500 to make effects more prevalent.
-    a_loss = 500 * (labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis))
+    # NOTE: Scale by factor to make effects more prevalent.
+    a_loss = GRAD_SCALE_FACTOR * (
+        labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
+    )
 
     # Create diagnostics retrieval graph
     a_diagnostics = [
@@ -569,8 +571,8 @@ if __name__ == "__main__":
     ################################################
 
     # Compute lyapunov Critic error
-    # NOTE: Scale by 500 to make effects more prevalent.
-    l_error = 500 * tf.compat.v1.losses.mean_squared_error(
+    # NOTE: Scale by factor to make effects more prevalent.
+    l_error = GRAD_SCALE_FACTOR * tf.compat.v1.losses.mean_squared_error(
         labels=l_target, predictions=l
     )
 

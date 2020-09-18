@@ -2,3 +2,6 @@
 .vscode/
 __pycache__/
 log/
+
+# Files to ignore
+*.code-workspace
