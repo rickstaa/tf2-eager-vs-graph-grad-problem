@@ -40,6 +40,9 @@ LR_A = 1e-4  # The actor learning rate
 LR_L = 3e-4  # The lyapunov critic
 LR_LAG = 1e-4  # The lagrance multiplier learning rate
 
+# Gradient settings
+GRAD_SCALE_FACTOR = 500  # Scale the grads by a factor to make differences more visible
+
 ####################################################
 # Seed random number generators ####################
 ####################################################
@@ -103,10 +106,10 @@ def retrieve_weights_biases():
     lc_target_vars = tf.compat.v1.get_collection(
         tf.compat.v1.GraphKeys.GLOBAL_VARIABLES, scope="Actor/Actor/lyapunov_critic",
     )
-    ga_weights_biases = policy.sess.run(ga_vars)
-    ga_target_weights_biases = policy.sess.run(ga_target_vars)
-    lc_weights_biases = policy.sess.run(lc_vars)
-    lc_target_weights_biases = policy.sess.run(lc_target_vars)
+    ga_weights_biases = sess.run(ga_vars)
+    ga_target_weights_biases = sess.run(ga_target_vars)
+    lc_weights_biases = sess.run(lc_vars)
+    lc_target_weights_biases = sess.run(lc_target_vars)
     ga_weights_biases = {
         "l1/weights": ga_weights_biases[0],
         "l1/bias": ga_weights_biases[1],
@@ -152,452 +155,173 @@ def retrieve_weights_biases():
 
 
 ####################################################
-# Agent class ######################################
+# Used network functions ###########################
 ####################################################
-class LAC(object):
-    """The lyapunov actor critic agent.
+def SquashedGaussianActorGraph(
+    s, name="gaussian_actor", reuse=None, custom_getter=None, seeds=[None, None],
+):
+    """Setup SquashedGaussianActor Graph.
+
+    Args:
+        s (tf.Tensor): [description]
+
+        name (str, optional): Network name. Defaults to "actor".
+
+        reuse (Bool, optional): Whether the network has to be trainable. Defaults
+            to None.
+
+        custom_getter (object, optional): Overloads variable creation process.
+            Defaults to None.
+
+        seeds (list, optional): The random seeds used for the weight initialization
+            and the sampling ([weights_seed, sampling_seed]). Defaults to
+            [None, None]
+
+    Returns:
+        tuple: Tuple with network output tensors.
     """
 
-    def __init__(self):
+    # Set trainability
+    trainable = True if reuse is None else False
 
-        # Save action and observation space as members
-        self.a_dim = A_DIM
-        self.s_dim = S_DIM
+    # Create weight initializer
+    initializer = tf.keras.initializers.GlorotUniform(seed=seeds[0])
 
-        # Set algorithm parameters as class objects
-        self.network_structure = NETWORK_STRUCTURE
-        self.polyak = POLYAK
+    # Create graph
+    with tf.compat.v1.variable_scope(name, reuse=reuse, custom_getter=custom_getter):
 
-        # Create network seeds
-        self.ga_seeds = [
-            RANDOM_SEED,
-            TFP_SEED_STREAM(),
-        ]  # [weight init seed, sample seed]
-        self.ga_target_seeds = [
-            RANDOM_SEED + 1,
-            TFP_SEED_STREAM(),
-        ]  # [weight init seed, sample seed]
-        self.lya_ga_target_seeds = [
-            RANDOM_SEED,
-            TFP_SEED_STREAM(),
-        ]  # [weight init seed, sample seed]
-        self.lc_seed = RANDOM_SEED + 2  # Weight init seed
-        self.lc_target_seed = RANDOM_SEED + 3  # Weight init seed
+        # Retrieve hidden layer sizes
+        n1 = NETWORK_STRUCTURE["actor"][0]
+        n2 = NETWORK_STRUCTURE["actor"][1]
 
-        # Determine target entropy
-        self.target_entropy = -A_DIM  # lower bound of the policy entropy
+        # Create actor hidden/ output layers
+        net_0 = tf.compat.v1.layers.dense(
+            s,
+            n1,
+            activation=tf.nn.relu,
+            name="l1",
+            trainable=trainable,
+            kernel_initializer=initializer,
+        )  # 原始是30
+        net_1 = tf.compat.v1.layers.dense(
+            net_0,
+            n2,
+            activation=tf.nn.relu,
+            name="l2",
+            trainable=trainable,
+            kernel_initializer=initializer,
+        )  # 原始是30
+        mu = tf.compat.v1.layers.dense(
+            net_1,
+            A_DIM,
+            activation=None,
+            name="mu",
+            trainable=trainable,
+            kernel_initializer=initializer,
+        )
+        log_sigma = tf.compat.v1.layers.dense(
+            net_1,
+            A_DIM,
+            activation=None,
+            name="log_sigma",
+            trainable=trainable,
+            kernel_initializer=initializer,
+        )
+        log_sigma = tf.clip_by_value(log_sigma, *LOG_SIGMA_MIN_MAX)
 
-        # Create tensorflow session
-        self.sess = tf.compat.v1.Session()
+        # Calculate log probability standard deviation
+        sigma = tf.exp(log_sigma)
 
-        # Create networks, optimizers and variables inside the Actor scope
-        with tf.compat.v1.variable_scope("Actor"):
+        # Create bijectors (Used in the reparameterization trick)
+        squash_bijector = SquashBijector()
+        affine_bijector = tfp.bijectors.Shift(mu)(tfp.bijectors.Scale(sigma))
 
-            # Create observations placeholders
-            self.S = tf.compat.v1.placeholder(tf.float32, [None, self.s_dim], "s")
-            self.S_ = tf.compat.v1.placeholder(tf.float32, [None, self.s_dim], "s_")
-            self.a_input = tf.compat.v1.placeholder(
-                tf.float32, [None, self.a_dim], "a_input"
-            )
-            self.a_input_ = tf.compat.v1.placeholder(
-                tf.float32, [None, self.a_dim], "a_input_"
-            )
-            self.R = tf.compat.v1.placeholder(tf.float32, [None, 1], "r")
-            self.terminal = tf.compat.v1.placeholder(tf.float32, [None, 1], "terminal")
+        # Sample from the normal distribution and calculate the action
+        batch_size = tf.shape(input=s)[0]
+        base_distribution = tfp.distributions.MultivariateNormalDiag(
+            loc=tf.zeros(A_DIM), scale_diag=tf.ones(A_DIM)
+        )
+        epsilon = base_distribution.sample(batch_size, seed=seeds[1])
+        raw_action = affine_bijector.forward(epsilon)
+        clipped_a = squash_bijector.forward(raw_action)
 
-            # Create Learning rate placeholders
-            self.LR_A = tf.compat.v1.placeholder(tf.float32, None, "LR_A")
-            self.LR_lag = tf.compat.v1.placeholder(tf.float32, None, "LR_lag")
-            self.LR_L = tf.compat.v1.placeholder(tf.float32, None, "LR_L")
+        # Transform distribution back to the original policy distribution
+        reparm_trick_bijector = tfp.bijectors.Chain((squash_bijector, affine_bijector))
+        distribution = tfp.distributions.TransformedDistribution(
+            distribution=base_distribution, bijector=reparm_trick_bijector
+        )
+        clipped_mu = squash_bijector.forward(mu)
 
-            # Create lagrance multiplier placeholders
-            self.log_labda = tf.compat.v1.get_variable(
-                "lambda", None, tf.float32, initializer=tf.math.log(LAMBDA)
-            )
-            self.log_alpha = tf.compat.v1.get_variable(
-                "alpha", None, tf.float32, initializer=tf.math.log(ALPHA)
-            )
-            self.labda = tf.clip_by_value(tf.exp(self.log_labda), *SCALE_lambda_MIN_MAX)
-            self.alpha = tf.exp(self.log_alpha)
+    # Return network output graphs
+    return clipped_a, clipped_mu, distribution, epsilon
 
-            ###########################################
-            # Create Networks #########################
-            ###########################################
 
-            # Create Gaussian Actor (GA) and Lyapunov critic (LC) Networks
-            self.a, self.deterministic_a, self.a_dist, self.epsilon = self._build_a(
-                self.S, seeds=self.ga_seeds
-            )
-            self.l = self._build_l(self.S, self.a_input, seed=self.lc_seed)
-            self.log_pis = log_pis = self.a_dist.log_prob(
-                self.a
-            )  # Gaussian actor action log_probability
+def LyapunovCriticGraph(
+    s, a, name="lyapunov_critic", reuse=None, custom_getter=None, seed=None,
+):
+    """Setup lyapunov critic graph.
 
-            # Retrieve GA and LC network parameters
-            self.a_params = tf.compat.v1.get_collection(
-                tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope="Actor/gaussian_actor"
-            )
-            self.l_params = tf.compat.v1.get_collection(
-                tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES,
-                scope="Actor/lyapunov_critic",
-            )
+    Args:
+        s (tf.Tensor): Tensor of observations.
 
-            # Create EMA target network update policy (Soft replacement)
-            ema = tf.train.ExponentialMovingAverage(decay=(self.polyak))
+        a (tf.Tensor): Tensor with actions.
 
-            def ema_getter(getter, name, *args, **kwargs):
-                return ema.average(getter(name, *args, **kwargs))
+        reuse (Bool, optional): Whether the network has to be trainable. Defaults
+            to None.
 
-            target_update = [
-                ema.apply(self.a_params),
-                ema.apply(self.l_params),
-            ]
+        custom_getter (object, optional): Overloads variable creation process.
+            Defaults to None.
 
-            # Create GA and LC target networks
-            # Don't get optimized but get updated according to the EMA of the main
-            # networks
-            self.a_, self.deterministic_a_, self.a_dist_, self.epsilon_ = self._build_a(
-                self.S_,
-                reuse=True,
-                custom_getter=ema_getter,
-                seeds=self.ga_target_seeds,
-            )
-            self.log_pis_ = self.a_dist_.log_prob(
-                self.a_
-            )  # Gaussian actor action log_probability
-            self.l_ = self._build_l(
-                self.S_,
-                self.a_,
-                reuse=True,
-                custom_getter=ema_getter,
-                seed=self.lc_target_seed,
-            )
+        seed (int, optional): The seed used for the weight initialization. Defaults
+            to None.
 
-            # Create Networks for the (fixed) lyapunov temperature boundary
-            # DEBUG: This graph has the same parameters as the original gaussian actor
-            # but now it receives the next state. This was needed as the target network
-            # uses exponential moving average.
-            (
-                self.lya_a_,
-                self.lya_deterministic_a_,
-                self.lya_a_dist_,
-                self.lya_epsilon_,
-            ) = self._build_a(self.S_, reuse=True, seeds=self.lya_ga_target_seeds)
-            self.lya_log_pis_ = self.lya_a_dist_.log_prob(
-                self.lya_a_
-            )  # Gaussian actor action log_probability
-            self.lya_l_ = self._build_l(
-                self.S_, self.lya_a_, reuse=True, seed=self.lc_seed,
-            )
 
-            ###########################################
-            # Create Loss functions and optimizers ####
-            ###########################################
+    Returns:
+        tuple: Tuple with network output tensors.
+    """
 
-            # Lyapunov constraint function
-            self.l_delta = tf.reduce_mean(
-                input_tensor=(self.lya_l_ - self.l + ALPHA_3 * self.R)
-            )
+    # Set trainability
+    trainable = True if reuse is None else False
 
-            # Lagrance multiplier loss functions and optimizers graphs
-            self.labda_loss = -tf.reduce_mean(
-                input_tensor=(self.log_labda * self.l_delta)
-            )
-            self.alpha_loss = -tf.reduce_mean(
-                input_tensor=(
-                    self.log_alpha * tf.stop_gradient(log_pis + self.target_entropy)
+    # Create weight initializer
+    initializer = tf.keras.initializers.GlorotUniform(seed=seed)
+
+    # Create graph
+    with tf.compat.v1.variable_scope(name, reuse=reuse, custom_getter=custom_getter):
+
+        # Retrieve hidden layer size
+        n1 = NETWORK_STRUCTURE["critic"][0]
+
+        # Create actor hidden/ output layers
+        layers = []
+        w1_s = tf.compat.v1.get_variable(
+            "w1_s", [S_DIM, n1], trainable=trainable, initializer=initializer,
+        )
+        w1_a = tf.compat.v1.get_variable(
+            "w1_a", [A_DIM, n1], trainable=trainable, initializer=initializer,
+        )
+        b1 = tf.compat.v1.get_variable(
+            "b1", [1, n1], trainable=trainable, initializer=tf.zeros_initializer()
+        )
+        net_0 = tf.nn.relu(tf.matmul(s, w1_s) + tf.matmul(a, w1_a) + b1)
+        layers.append(net_0)
+        for i in range(1, len(NETWORK_STRUCTURE["critic"])):
+            n = NETWORK_STRUCTURE["critic"][i]
+            layers.append(
+                tf.compat.v1.layers.dense(
+                    layers[i - 1],
+                    n,
+                    activation=tf.nn.relu,
+                    name="l" + str(i + 1),
+                    trainable=trainable,
+                    kernel_initializer=initializer,
                 )
             )
 
-            # Create optimizers
-
-            # Alpha optimizer graph
-            self.alpha_opt = tf.compat.v1.train.AdamOptimizer(self.LR_A)
-            self.alpha_grads = self.alpha_opt.compute_gradients(
-                self.alpha_loss, var_list=self.log_alpha
-            )
-            self.alpha_train = self.alpha_opt.apply_gradients(self.alpha_grads)
-
-            # Lambda optimizer graph
-            self.lambda_opt = tf.compat.v1.train.AdamOptimizer(self.LR_lag)
-            self.lambda_grads = self.lambda_opt.compute_gradients(
-                self.labda_loss, var_list=self.log_labda
-            )
-            self.lambda_train = self.lambda_opt.apply_gradients(self.lambda_grads)
-
-            # Actor optimizer graph
-            a_loss = self.labda * self.l_delta + self.alpha * tf.reduce_mean(
-                input_tensor=log_pis
-            )
-            self.a_loss = a_loss
-            self.a_opt = tf.compat.v1.train.AdamOptimizer(self.LR_A)
-            self.a_grads = self.a_opt.compute_gradients(
-                self.a_loss, var_list=self.a_params
-            )
-            self.a_train = self.a_opt.apply_gradients(self.a_grads)
-
-            # Create Lyapunov Critic loss function and optimizer
-            # NOTE: The control dependency makes sure the target networks are updated
-            # first
-            with tf.control_dependencies(target_update):
-
-                # Lyapunov candidate constraint function graph
-                self.l_target = self.R + GAMMA * (1 - self.terminal) * tf.stop_gradient(
-                    self.l_
-                )
-
-                self.l_error = tf.compat.v1.losses.mean_squared_error(
-                    labels=self.l_target, predictions=self.l
-                )
-
-                # New splitted optimizer
-                self.l_opt = tf.compat.v1.train.AdamOptimizer(self.LR_L)
-                self.l_grads = self.l_opt.compute_gradients(
-                    self.l_error, var_list=self.l_params
-                )
-                self.l_train = self.l_opt.apply_gradients(self.l_grads)
-
-            # Initialize variables, create saver and diagnostics graph
-            self.entropy = tf.reduce_mean(input_tensor=-self.log_pis)
-            self.sess.run(tf.compat.v1.global_variables_initializer())
-            self.saver = tf.compat.v1.train.Saver()
-            self.diagnostics = [
-                self.l_delta,
-                self.labda,
-                self.alpha,
-                self.log_labda,
-                self.log_alpha,
-                self.labda_loss,
-                self.alpha_loss,
-                self.l_target,
-                self.l_error,
-                self.a_loss,
-                self.entropy,
-                self.l,
-                self.l_,
-                self.lya_l_,
-                self.a,
-                self.a_,
-                self.lya_a_,
-                self.lambda_grads,
-                self.alpha_grads,
-                self.a_grads,
-                self.l_grads,
-            ]
-
-            # Concatentate optimizer graphs
-            self.opt = [self.l_train, self.lambda_train, self.a_train, self.alpha_train]
-
-    def _build_a(
-        self,
-        s,
-        name="gaussian_actor",
-        reuse=None,
-        custom_getter=None,
-        seeds=[None, None],
-    ):
-        """Setup SquashedGaussianActor Graph.
-
-        Args:
-            s (tf.Tensor): [description]
-
-            name (str, optional): Network name. Defaults to "actor".
-
-            reuse (Bool, optional): Whether the network has to be trainable. Defaults
-                to None.
-
-            custom_getter (object, optional): Overloads variable creation process.
-                Defaults to None.
-
-            seeds (list, optional): The random seeds used for the weight initialization
-                and the sampling ([weights_seed, sampling_seed]). Defaults to
-                [None, None]
-
-        Returns:
-            tuple: Tuple with network output tensors.
-        """
-
-        # Set trainability
-        trainable = True if reuse is None else False
-
-        # Create weight initializer
-        initializer = tf.keras.initializers.GlorotUniform(seed=seeds[0])
-
-        # Create graph
-        with tf.compat.v1.variable_scope(
-            name, reuse=reuse, custom_getter=custom_getter
-        ):
-
-            # Retrieve hidden layer sizes
-            n1 = self.network_structure["actor"][0]
-            n2 = self.network_structure["actor"][1]
-
-            # Create actor hidden/ output layers
-            net_0 = tf.compat.v1.layers.dense(
-                s,
-                n1,
-                activation=tf.nn.relu,
-                name="l1",
-                trainable=trainable,
-                kernel_initializer=initializer,
-            )  # 原始是30
-            net_1 = tf.compat.v1.layers.dense(
-                net_0,
-                n2,
-                activation=tf.nn.relu,
-                name="l2",
-                trainable=trainable,
-                kernel_initializer=initializer,
-            )  # 原始是30
-            mu = tf.compat.v1.layers.dense(
-                net_1,
-                self.a_dim,
-                activation=None,
-                name="mu",
-                trainable=trainable,
-                kernel_initializer=initializer,
-            )
-            log_sigma = tf.compat.v1.layers.dense(
-                net_1,
-                self.a_dim,
-                activation=None,
-                name="log_sigma",
-                trainable=trainable,
-                kernel_initializer=initializer,
-            )
-            log_sigma = tf.clip_by_value(log_sigma, *LOG_SIGMA_MIN_MAX)
-
-            # Calculate log probability standard deviation
-            sigma = tf.exp(log_sigma)
-
-            # Create bijectors (Used in the reparameterization trick)
-            squash_bijector = SquashBijector()
-            affine_bijector = tfp.bijectors.Shift(mu)(tfp.bijectors.Scale(sigma))
-
-            # Sample from the normal distribution and calculate the action
-            batch_size = tf.shape(input=s)[0]
-            base_distribution = tfp.distributions.MultivariateNormalDiag(
-                loc=tf.zeros(self.a_dim), scale_diag=tf.ones(self.a_dim)
-            )
-            epsilon = base_distribution.sample(batch_size, seed=seeds[1])
-            raw_action = affine_bijector.forward(epsilon)
-            clipped_a = squash_bijector.forward(raw_action)
-
-            # Transform distribution back to the original policy distribution
-            reparm_trick_bijector = tfp.bijectors.Chain(
-                (squash_bijector, affine_bijector)
-            )
-            distribution = tfp.distributions.TransformedDistribution(
-                distribution=base_distribution, bijector=reparm_trick_bijector
-            )
-            clipped_mu = squash_bijector.forward(mu)
-
-        # Return network output graphs
-        return clipped_a, clipped_mu, distribution, epsilon
-
-    def _build_l(
-        self, s, a, name="lyapunov_critic", reuse=None, custom_getter=None, seed=None,
-    ):
-        """Setup lyapunov critic graph.
-
-        Args:
-            s (tf.Tensor): Tensor of observations.
-
-            a (tf.Tensor): Tensor with actions.
-
-            reuse (Bool, optional): Whether the network has to be trainable. Defaults
-                to None.
-
-            custom_getter (object, optional): Overloads variable creation process.
-                Defaults to None.
-
-            seed (int, optional): The seed used for the weight initialization. Defaults
-                to None.
-
-
-        Returns:
-            tuple: Tuple with network output tensors.
-        """
-
-        # Set trainability
-        trainable = True if reuse is None else False
-
-        # Create weight initializer
-        initializer = tf.keras.initializers.GlorotUniform(seed=seed)
-
-        # Create graph
-        with tf.compat.v1.variable_scope(
-            name, reuse=reuse, custom_getter=custom_getter
-        ):
-
-            # Retrieve hidden layer size
-            n1 = self.network_structure["critic"][0]
-
-            # Create actor hidden/ output layers
-            layers = []
-            w1_s = tf.compat.v1.get_variable(
-                "w1_s", [self.s_dim, n1], trainable=trainable, initializer=initializer,
-            )
-            w1_a = tf.compat.v1.get_variable(
-                "w1_a", [self.a_dim, n1], trainable=trainable, initializer=initializer,
-            )
-            b1 = tf.compat.v1.get_variable(
-                "b1", [1, n1], trainable=trainable, initializer=tf.zeros_initializer()
-            )
-            net_0 = tf.nn.relu(tf.matmul(s, w1_s) + tf.matmul(a, w1_a) + b1)
-            layers.append(net_0)
-            for i in range(1, len(self.network_structure["critic"])):
-                n = self.network_structure["critic"][i]
-                layers.append(
-                    tf.compat.v1.layers.dense(
-                        layers[i - 1],
-                        n,
-                        activation=tf.nn.relu,
-                        name="l" + str(i + 1),
-                        trainable=trainable,
-                        kernel_initializer=initializer,
-                    )
-                )
-
-            # Return lyapunov critic object
-            return tf.expand_dims(
-                tf.reduce_sum(input_tensor=tf.square(layers[-1]), axis=1), axis=1
-            )  # L(s,a)
-
-    def learn(self, LR_A, LR_L, LR_lag, batch):
-        """Runs the SGD to update all the optimize parameters.
-
-        Args:
-            LR_A (float): Current actor learning rate.
-            LR_L (float): Lyapunov critic learning rate.
-            LR_lag (float): Lyapunov constraint langrance multiplier learning rate.
-            batch (numpy.ndarray): The batch of experiences.
-
-        Returns:
-            Tuple: Tuple with diagnostics variables of the SGD.
-        """
-
-        # Retrieve state, action and reward from the batch
-        bs = batch["s"]  # state
-        ba = batch["a"]  # action
-        br = batch["r"]  # reward
-        bterminal = batch["terminal"]
-        bs_ = batch["s_"]  # next state
-
-        # Fill optimizer variable feed critic
-        feed_dict = {
-            self.a_input: ba,
-            self.S: bs,
-            self.S_: bs_,
-            self.R: br,
-            self.terminal: bterminal,
-            self.LR_A: LR_A,
-            self.LR_L: LR_L,
-            self.LR_lag: LR_lag,
-        }
-
-        # Run optimization and return diagnostics
-        return self.sess.run([self.opt, self.diagnostics], feed_dict)[1]
+        # Return lyapunov critic object
+        return tf.expand_dims(
+            tf.reduce_sum(input_tensor=tf.square(layers[-1]), axis=1), axis=1
+        )  # L(s,a)
 
 
 ####################################################
@@ -605,8 +329,146 @@ class LAC(object):
 ####################################################
 if __name__ == "__main__":
 
-    # Create the Lyapunov Actor Critic agent
-    policy = LAC()
+    # Set algorithm parameters as class objects
+    log_labda = tf.Variable(tf.math.log(LAMBDA), name="log_lambda")
+    log_alpha = tf.Variable(tf.math.log(ALPHA), name="log_alpha")
+    labda = tf.math.exp(log_labda)
+    alpha = tf.math.exp(log_alpha)
+
+    # Determine target entropy
+    target_entropy = -A_DIM  # lower bound of the policy entropy
+
+    # Create network seeds
+    ga_seeds = [
+        RANDOM_SEED,
+        TFP_SEED_STREAM(),
+    ]  # [weight init seed, sample seed]
+    ga_target_seeds = [
+        RANDOM_SEED + 1,
+        TFP_SEED_STREAM(),
+    ]  # [weight init seed, sample seed]
+    lya_ga_target_seeds = [
+        RANDOM_SEED,
+        TFP_SEED_STREAM(),
+    ]  # [weight init seed, sample seed]
+    lc_seed = RANDOM_SEED + 2  # Weight init seed
+    lc_target_seed = RANDOM_SEED + 3  # Weight init seed
+
+    # Create tensorflow session
+    sess = tf.compat.v1.Session()
+
+    ###########################################
+    # Create graphs ###########################
+    ###########################################
+
+    # Create variables, placeholders, networks and loss functions
+    with tf.compat.v1.variable_scope("Actor"):
+
+        # Create observations placeholders
+        S = tf.compat.v1.placeholder(tf.float32, [None, S_DIM], "s")
+        S_ = tf.compat.v1.placeholder(tf.float32, [None, S_DIM], "s_")
+        a_input = tf.compat.v1.placeholder(tf.float32, [None, A_DIM], "a_input")
+        R = tf.compat.v1.placeholder(tf.float32, [None, 1], "r")
+        terminal = tf.compat.v1.placeholder(tf.float32, [None, 1], "terminal")
+
+        # Create Learning rate placeholders
+        LR_A = tf.compat.v1.placeholder(tf.float32, None, "LR_A")
+        LR_lag = tf.compat.v1.placeholder(tf.float32, None, "LR_lag")
+        LR_L = tf.compat.v1.placeholder(tf.float32, None, "LR_L")
+
+        # Create lagrance multiplier placeholders
+        log_labda = tf.compat.v1.get_variable(
+            "lambda", None, tf.float32, initializer=tf.math.log(LAMBDA)
+        )
+        log_alpha = tf.compat.v1.get_variable(
+            "alpha", None, tf.float32, initializer=tf.math.log(ALPHA)
+        )
+        labda = tf.clip_by_value(tf.exp(log_labda), *SCALE_lambda_MIN_MAX)
+        alpha = tf.exp(log_alpha)
+
+        ###########################################
+        # Create Networks #########################
+        ###########################################
+
+        # Create Gaussian Actor (GA) and Lyapunov critic (LC) Networks
+        a, _, a_dist, _ = SquashedGaussianActorGraph(S, seeds=ga_seeds)
+        l = LyapunovCriticGraph(S, a_input, seed=lc_seed)
+        log_pis = a_dist.log_prob(a)  # Gaussian actor action log_probability
+
+        # Retrieve GA and LC network parameters
+        a_params = tf.compat.v1.get_collection(
+            tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope="Actor/gaussian_actor"
+        )
+        l_params = tf.compat.v1.get_collection(
+            tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, scope="Actor/lyapunov_critic",
+        )
+
+        # Create EMA target network update policy (Soft replacement)
+        ema = tf.train.ExponentialMovingAverage(decay=(POLYAK))
+
+        def ema_getter(getter, name, *args, **kwargs):
+            return ema.average(getter(name, *args, **kwargs))
+
+        target_update = [
+            ema.apply(a_params),
+            ema.apply(l_params),
+        ]
+
+        # Create GA and LC target networks
+        # Don't get optimized but get updated according to the EMA of the main
+        # networks
+        a_, _, _, _ = SquashedGaussianActorGraph(
+            S_, reuse=True, custom_getter=ema_getter, seeds=ga_target_seeds,
+        )
+        l_ = LyapunovCriticGraph(
+            S_, a_, reuse=True, custom_getter=ema_getter, seed=lc_target_seed,
+        )
+
+        # Create Networks for the (fixed) lyapunov temperature boundary
+        # DEBUG: This graph has the same parameters as the original gaussian actor
+        # but now it receives the next state. This was needed as the target network
+        # uses exponential moving average.
+        (lya_a_, _, _, _,) = SquashedGaussianActorGraph(
+            S_, reuse=True, seeds=lya_ga_target_seeds
+        )
+        lya_l_ = LyapunovCriticGraph(S_, lya_a_, reuse=True, seed=lc_seed)
+
+        ###########################################
+        # Create Loss functions and optimizers ####
+        ###########################################
+
+        # Lyapunov constraint function
+        l_delta = tf.reduce_mean(input_tensor=(lya_l_ - l + ALPHA_3 * R))
+
+        # Create optimizers
+
+        # Actor optimizer graph
+        a_loss = labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
+        a_opt = tf.compat.v1.train.AdamOptimizer(LR_A)
+        a_grads = a_opt.compute_gradients(a_loss, var_list=a_params)
+
+        # Create Lyapunov Critic loss function and optimizer
+        # NOTE: The control dependency makes sure the target networks are updated
+        # first
+        with tf.control_dependencies(target_update):
+
+            # Lyapunov candidate constraint function graph
+            l_target = R + GAMMA * (1 - terminal) * tf.stop_gradient(l_)
+
+            l_error = tf.compat.v1.losses.mean_squared_error(
+                labels=l_target, predictions=l
+            )
+
+            # New splitted optimizer
+            l_opt = tf.compat.v1.train.AdamOptimizer(LR_L)
+            l_grads = l_opt.compute_gradients(l_error, var_list=l_params)
+
+        # Initialize variables, create saver and diagnostics graph
+        sess.run(tf.compat.v1.global_variables_initializer())
+
+    ###########################################
+    # Retrieve weights and create dummy batch #
+    ###########################################
 
     # Retrieve initial network weights
     (
@@ -619,49 +481,37 @@ if __name__ == "__main__":
     # Create dummy input
     # NOTE: Explicit seeding because of the difference between eager and graph mode
     tf.random.set_seed(0)
-    s_tmp = tf.random.uniform((BATCH_SIZE, policy.s_dim), seed=0)
-    a_tmp = tf.random.uniform((BATCH_SIZE, policy.a_dim), seed=1)
+    s_tmp = tf.random.uniform((BATCH_SIZE, S_DIM), seed=0)
+    a_tmp = tf.random.uniform((BATCH_SIZE, A_DIM), seed=1)
     r_tmp = tf.random.uniform((BATCH_SIZE, 1), seed=2)
     terminal_tmp = tf.cast(
         tf.random.uniform((BATCH_SIZE, 1), minval=0, maxval=2, dtype=tf.int32, seed=3),
         tf.float32,
     )
-    s_target_tmp = tf.random.uniform((BATCH_SIZE, policy.s_dim), seed=4)
+    s_target_tmp = tf.random.uniform((BATCH_SIZE, S_DIM), seed=4)
     batch = {
-        "s": policy.sess.run(s_tmp),
-        "a": policy.sess.run(a_tmp),
-        "r": policy.sess.run(r_tmp),
-        "terminal": policy.sess.run(terminal_tmp),
-        "s_": policy.sess.run(s_target_tmp),
+        "s": sess.run(s_tmp),
+        "a": sess.run(a_tmp),
+        "r": sess.run(r_tmp),
+        "terminal": sess.run(terminal_tmp),
+        "s_": sess.run(s_target_tmp),
     }
 
     ################################################
     # Validate actor grads #########################
     ################################################
 
-    # Create Actor Loss variables
-    log_labda = tf.compat.v1.get_variable(
-        "lambda", None, tf.float32, initializer=tf.math.log(LAMBDA)
-    )
-    log_alpha = tf.compat.v1.get_variable(
-        "alpha", None, tf.float32, initializer=tf.math.log(ALPHA)
-    )
-    labda = tf.clip_by_value(tf.exp(log_labda), *SCALE_lambda_MIN_MAX)
-    alpha = tf.exp(log_alpha)
-    policy.sess.run(tf.compat.v1.global_variables_initializer())
+    # Initialise variables
+    sess.run(tf.compat.v1.global_variables_initializer())
 
     # Compute Lyapunov difference
     # NOTE: This is similar to the Q backup (Q_- Q + alpha * R) but now while the agent
     # tries to satisfy the the lyapunov stability constraint.
-    l_delta = tf.reduce_mean(
-        input_tensor=(policy.lya_l_ - policy.l + ALPHA_3 * policy.R)
-    )
+    l_delta = tf.reduce_mean(input_tensor=(lya_l_ - l + ALPHA_3 * R))
 
     # Compute actor loss
     # NOTE: Scale by 500 to make effects more prevalent.
-    a_loss = 500 * (
-        labda * l_delta + alpha * tf.reduce_mean(input_tensor=policy.log_pis)
-    )
+    a_loss = 500 * (labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis))
 
     # Create diagnostics retrieval graph
     a_diagnostics = [
@@ -669,29 +519,31 @@ if __name__ == "__main__":
         alpha,
         l_delta,
         a_loss,
-        policy.log_pis,
-        policy.lya_l_,
-        policy.l,
-        policy.R,
+        log_pis,
+        lya_l_,
+        l,
     ]
 
     # Compute actor gradients
-    a_grads_graph = policy.a_opt.compute_gradients(a_loss, var_list=policy.a_params)
-    (a_grads, a_diagnostics) = policy.sess.run(
+    a_grads_graph = a_opt.compute_gradients(a_loss, var_list=a_params)
+    (a_grads_val, a_diagnostics) = sess.run(
         [a_grads_graph, a_diagnostics],
-        feed_dict={
-            policy.a_input: batch["a"],
-            policy.S_: batch["s_"],
-            policy.S: batch["s"],
-            policy.R: batch["r"],
-        },
+        feed_dict={a_input: batch["a"], S_: batch["s_"], S: batch["s"], R: batch["r"],},
     )
     a_grads_unpacked = [
-        grads[0] for grads in a_grads
+        grads[0] for grads in a_grads_val
     ]  # Unpack gradients for easy comparison
 
     # Unpack diagnostics
-    (labda, alpha, l_delta, a_loss, log_pis, lya_l_, l, R) = a_diagnostics
+    (
+        labda_val,
+        alpha_val,
+        l_delta_val,
+        a_loss_val,
+        log_pis_val,
+        lya_l_val,
+        l_val,
+    ) = a_diagnostics
 
     # Print gradients
     print("\n==GAUSSIAN ACTOR GRADIENTS==")
@@ -719,37 +571,35 @@ if __name__ == "__main__":
     # Compute lyapunov Critic error
     # NOTE: Scale by 500 to make effects more prevalent.
     l_error = 500 * tf.compat.v1.losses.mean_squared_error(
-        labels=policy.l_target, predictions=policy.l
+        labels=l_target, predictions=l
     )
 
     # Create diagnostics retrieval graph
     l_diagnostics = [
-        policy.l_target,
+        l_target,
         l_error,
-        policy.l,
-        policy.l_,
-        policy.R,
-        policy.terminal,
+        l,
+        l_,
     ]
 
     # Compute actor gradients
-    l_grads_graph = policy.a_opt.compute_gradients(l_error, var_list=policy.l_params)
-    (l_grads, l_diagnostics) = policy.sess.run(
+    l_grads_graph = a_opt.compute_gradients(l_error, var_list=l_params)
+    (l_grads_val, l_diagnostics) = sess.run(
         [l_grads_graph, l_diagnostics],
         feed_dict={
-            policy.a_input: batch["a"],
-            policy.S: batch["s"],
-            policy.S_: batch["s_"],
-            policy.terminal: batch["terminal"],
-            policy.R: batch["r"],
+            a_input: batch["a"],
+            S: batch["s"],
+            S_: batch["s_"],
+            terminal: batch["terminal"],
+            R: batch["r"],
         },
     )
     l_grads_unpacked = [
-        grads[0] for grads in l_grads
+        grads[0] for grads in l_grads_val
     ]  # Unpack gradients for easy comparison
 
     # Unpack diagnostics
-    (l_target, l_error, l, l_, R, terminal) = l_diagnostics
+    (l_target_val, l_error_Val, l_val, l_target_val) = l_diagnostics
 
     # Print gradients
     print("\n==LYAPUNOV CRITIC GRADIENTS==")

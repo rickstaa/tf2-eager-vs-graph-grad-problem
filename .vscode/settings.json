@@ -13,5 +13,6 @@
         "titleBar.inactiveBackground": "#69cdf599",
         "titleBar.inactiveForeground": "#15202b99"
     },
-    "peacock.color": "#69cdf5"
+    "peacock.color": "#69cdf5",
+    "python.pythonPath": "/home/ricks/miniconda3/envs/lac_clean_tf2_eager/bin/python"
 }
