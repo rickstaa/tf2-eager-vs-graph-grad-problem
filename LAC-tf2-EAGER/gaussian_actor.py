@@ -16,10 +16,28 @@ class SquashedGaussianActor(tf.keras.Model):
         name,
         log_std_min=-20,
         log_std_max=2.0,
-        seed=None,
+        trainable=True,
+        seeds=None,
         **kwargs
     ):
-        # TODO: Check if name results in problem
+        """Squashed Gaussian actor network.
+
+        Args:
+            obs_dim (int): The dimension of the observation space.
+
+            act_dim (int): The dimension of the action space.
+
+            hidden_sizes (list): Array containing the sizes of the hidden layers.
+
+            name (str): The keras module name.
+
+            trainable (bool, optional): Whether the weights of the network layers should
+                be trainable. Defaults to True.
+
+            seeds (list, optional): The random seeds used for the weight initialization
+                and the sampling ([weights_seed, sampling_seed]). Defaults to
+                [None, None]
+        """
         super().__init__(name=name, **kwargs)
 
         # Get class parameters
@@ -27,7 +45,11 @@ class SquashedGaussianActor(tf.keras.Model):
         self._log_std_max = log_std_max
         self.s_dim = obs_dim
         self.a_dim = act_dim
-        self.tfp_seed = tfp.util.SeedStream(seed, salt="random_beta")
+        self._seed = seeds[0]
+        self._initializer = tf.keras.initializers.GlorotUniform(
+            seed=self._seed
+        )  # Seed weights initializer
+        self._tfp_seed = seeds[1]
 
         # Create fully connected layers
         self.net = tf.keras.Sequential(
@@ -40,7 +62,11 @@ class SquashedGaussianActor(tf.keras.Model):
         for i, hidden_size_i in enumerate(hidden_sizes):
             self.net.add(
                 tf.keras.layers.Dense(
-                    hidden_size_i, activation="relu", name="l{}".format(i + 1)
+                    hidden_size_i,
+                    activation="relu",
+                    name=name + "/l{}".format(i + 1),
+                    trainable=trainable,
+                    kernel_initializer=self._initializer,
                 )
             )
 
@@ -50,7 +76,13 @@ class SquashedGaussianActor(tf.keras.Model):
                 tf.keras.layers.InputLayer(
                     dtype=tf.float32, input_shape=hidden_sizes[-1]
                 ),
-                tf.keras.layers.Dense(act_dim, activation=None, name="mu"),
+                tf.keras.layers.Dense(
+                    act_dim,
+                    activation=None,
+                    name=name + "/mu",
+                    trainable=trainable,
+                    kernel_initializer=self._initializer,
+                ),
             ]
         )
         self.log_sigma = tf.keras.Sequential(
@@ -58,7 +90,13 @@ class SquashedGaussianActor(tf.keras.Model):
                 tf.keras.layers.InputLayer(
                     dtype=tf.float32, input_shape=hidden_sizes[-1]
                 ),
-                tf.keras.layers.Dense(act_dim, activation=None, name="log_sigma"),
+                tf.keras.layers.Dense(
+                    act_dim,
+                    activation=None,
+                    name=name + "/log_sigma",
+                    kernel_initializer=self._initializer,
+                    trainable=trainable,
+                ),
             ]
         )
 
@@ -89,7 +127,7 @@ class SquashedGaussianActor(tf.keras.Model):
         base_distribution = tfp.distributions.MultivariateNormalDiag(
             loc=tf.zeros(self.a_dim), scale_diag=tf.ones(self.a_dim)
         )
-        epsilon = base_distribution.sample(batch_size, seed=self.tfp_seed())
+        epsilon = base_distribution.sample(batch_size, seed=self._tfp_seed)
         raw_action = affine_bijector.forward(epsilon)
         clipped_a = squash_bijector.forward(raw_action)
 

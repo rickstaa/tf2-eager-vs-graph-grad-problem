@@ -13,13 +13,39 @@ class LyapunovCritic(tf.keras.Model):
         name,
         log_std_min=-20,
         log_std_max=2.0,
-        **kwargs
+        trainable=True,
+        seed=None,
+        **kwargs,
     ):
+        """Lyapunov Critic network.
+
+        Args:
+            obs_dim (int): The dimension of the observation space.
+
+            act_dim (int): The dimension of the action space.
+
+            hidden_sizes (list): Array containing the sizes of the hidden layers.
+
+            name (str): The keras module name.
+
+            log_std_min (int, optional): The min log_std. Defaults to -20.
+
+            log_std_max (float, optional): The max log_std. Defaults to 2.0.
+
+            trainable (bool, optional): Whether the weights of the network layers should
+                be trainable. Defaults to True.
+
+            seed (int, optional): The random seed. Defaults to None.
+        """
         super().__init__(name=name, **kwargs)
 
         # Get class parameters
         self.s_dim = obs_dim
         self.a_dim = act_dim
+        self._seed = seed
+        self._initializer = tf.keras.initializers.GlorotUniform(
+            seed=self._seed
+        )  # Seed weights initializer
 
         # Create network layers
         self.net = tf.keras.Sequential(
@@ -32,7 +58,11 @@ class LyapunovCritic(tf.keras.Model):
         for i, hidden_size_i in enumerate(hidden_sizes):
             self.net.add(
                 tf.keras.layers.Dense(
-                    hidden_size_i, activation="relu", name=name + "l{}".format(i)
+                    hidden_size_i,
+                    activation="relu",
+                    name=name + "/{}".format(i),
+                    trainable=trainable,
+                    kernel_initializer=self._initializer,
                 )
             )
 

@@ -152,6 +152,7 @@ class SquashedGaussianActor(tf.keras.Model):
         name,
         log_std_min=-20,
         log_std_max=2.0,
+        trainable=True,
         seeds=None,
         **kwargs,
     ):
@@ -169,6 +170,9 @@ class SquashedGaussianActor(tf.keras.Model):
             log_std_min (int, optional): The min log_std. Defaults to -20.
 
             log_std_max (float, optional): The max log_std. Defaults to 2.0.
+
+            trainable (bool, optional): Whether the weights of the network layers should
+                be trainable. Defaults to True.
 
             seeds (list, optional): The random seeds used for the weight initialization
                 and the sampling ([weights_seed, sampling_seed]). Defaults to

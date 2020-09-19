@@ -9,6 +9,7 @@ import random
 
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 
 from gaussian_actor import SquashedGaussianActor
 from lyapunov_critic import LyapunovCritic
@@ -36,10 +37,10 @@ from variant import (
 if RANDOM_SEED is not None:
     os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # new flag present in tf 2.0+
-    np.random.seed(RANDOM_SEED)
-    tf.compat.v1.reset_default_graph()
-    tf.random.set_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    tf.random.set_seed(RANDOM_SEED)
+    TFP_SEED_STREAM = tfp.util.SeedStream(RANDOM_SEED, salt="tfp_1")
 
 # Check if eager mode is enabled
 print("Tensorflow eager mode enabled: " + str(tf.executing_eagerly()))
@@ -49,7 +50,7 @@ if not USE_GPU:
     tf.config.set_visible_devices([], "GPU")
 
 # Tensorboard settings
-USE_TB = False  # Whether you want to log to tensorboard
+USE_TB = True  # Whether you want to log to tensorboard
 TB_FREQ = 4  # After how many episode we want to log to tensorboard
 WRITE_W_B = False  # Whether you want to log the model weights and biases
 
@@ -90,6 +91,22 @@ class LAC(object):
         self.network_structure = ALG_PARAMS["network_structure"]
         self.polyak = 1 - ALG_PARAMS["tau"]
 
+        # Create network seeds
+        self.ga_seeds = [
+            RANDOM_SEED,
+            TFP_SEED_STREAM(),
+        ]  # [weight init seed, sample seed]
+        self.ga_target_seeds = [
+            RANDOM_SEED + 1,
+            TFP_SEED_STREAM(),
+        ]  # [weight init seed, sample seed]
+        # self.lya_ga_target_seeds = [
+        #     RANDOM_SEED,
+        #     TFP_SEED_STREAM(),
+        # ]  # [weight init seed, sample seed]
+        self.lc_seed = RANDOM_SEED + 2  # Weight init seed
+        self.lc_target_seed = RANDOM_SEED + 3  # Weight init seed
+
         # Determine target entropy
         if ALG_PARAMS["target_entropy"] is None:
             self.target_entropy = -self.a_dim  # lower bound of the policy entropy
@@ -110,14 +127,14 @@ class LAC(object):
         ###########################################
 
         # Create Gaussian Actor (GA) and Lyapunov critic (LC) Networks
-        self.ga = self._build_a()
-        self.lc = self._build_l()
+        self.ga = self._build_a(seeds=self.ga_seeds)
+        self.lc = self._build_l(seed=self.lc_seed)
 
         # Create GA and LC target networks
         # Don't get optimized but get updated according to the EMA of the main
         # networks
-        self.ga_ = self._build_a()
-        self.lc_ = self._build_l()
+        self.ga_ = self._build_a(seeds=self.ga_target_seeds)
+        self.lc_ = self._build_l(seed=self.lc_target_seed)
         self.target_init()
 
         # Create summary writer
@@ -258,9 +275,9 @@ class LAC(object):
             # Calculate actor loss
             # TODO: VAliate whether tf.stop_gradient() is needed
             # a_loss = self.labda * self.l_delta + self.alpha * tf.reduce_mean(log_pis)
-            a_loss = tf.stop_gradient(self.labda) * self.l_delta + tf.stop_gradient(
-                self.alpha
-            ) * tf.reduce_mean(log_pis)
+            a_loss = tf.stop_gradient(self.labda) * tf.stop_gradient(
+                self.l_delta
+            ) + tf.stop_gradient(self.alpha) * tf.reduce_mean(log_pis)
 
         # Apply gradients
         a_grads = tape.gradient(a_loss, self.ga.trainable_variables)
@@ -298,16 +315,21 @@ class LAC(object):
             a_loss,
         )
 
-    def _build_a(self, name="gaussian_actor"):
+    def _build_a(self, name="gaussian_actor", trainable=True, seeds=[None, None]):
         """Setup SquashedGaussianActor Graph.
 
         Args:
             name (str, optional): Network name. Defaults to "gaussian_actor".
 
+            trainable (bool, optional): Whether the weights of the network layers should
+                be trainable. Defaults to True.
+
+            seeds (list, optional): The random seeds used for the weight initialization
+                and the sampling ([weights_seed, sampling_seed]). Defaults to
+                [None, None]
         Returns:
             tuple: Tuple with network output tensors.
         """
-        # TODO: Check if trainable is needed
 
         # Return GA
         return SquashedGaussianActor(
@@ -317,14 +339,21 @@ class LAC(object):
             name=name,
             log_std_min=LOG_SIGMA_MIN_MAX[0],
             log_std_max=LOG_SIGMA_MIN_MAX[1],
-            seed=RANDOM_SEED,
+            trainable=trainable,
+            seeds=seeds,
         )
 
-    def _build_l(self, name="lyapunov_critic"):
+    def _build_l(self, name="lyapunov_critic", trainable=True, seed=None):
         """Setup lyapunov critic graph.
 
         Args:
             name (str, optional): Network name. Defaults to "lyapunov_critic".
+
+            trainable (bool, optional): Whether the weights of the network layers should
+                be trainable. Defaults to True.
+
+            seed (int, optional): The seed used for the weight initialization. Defaults
+                to None.
 
         Returns:
             tuple: Tuple with network output tensors.
@@ -337,6 +366,8 @@ class LAC(object):
             act_dim=self.a_dim,
             hidden_sizes=self.network_structure["critic"],
             name=name,
+            trainable=trainable,
+            seed=seed,
         )
 
     def save_result(self, path):

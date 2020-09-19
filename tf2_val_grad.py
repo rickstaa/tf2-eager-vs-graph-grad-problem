@@ -347,10 +347,10 @@ if __name__ == "__main__":
         RANDOM_SEED + 1,
         TFP_SEED_STREAM(),
     ]  # [weight init seed, sample seed]
-    lya_ga_target_seeds = [
-        RANDOM_SEED,
-        TFP_SEED_STREAM(),
-    ]  # [weight init seed, sample seed]
+    # lya_ga_target_seeds = [
+    #     RANDOM_SEED,
+    #     TFP_SEED_STREAM(),
+    # ]  # [weight init seed, sample seed]
     lc_seed = RANDOM_SEED + 2  # Weight init seed
     lc_target_seed = RANDOM_SEED + 3  # Weight init seed
 
@@ -428,9 +428,11 @@ if __name__ == "__main__":
         # DEBUG: This graph has the same parameters as the original gaussian actor
         # but now it receives the next state. This was needed as the target network
         # uses exponential moving average.
-        (lya_a_, _, _, _,) = SquashedGaussianActorGraph(
-            S_, reuse=True, seeds=lya_ga_target_seeds
-        )
+        # (lya_a_, _, _, _,) = SquashedGaussianActorGraph(
+        #     S_, reuse=True, seeds=lya_ga_target_seeds
+        # )
+        (lya_a_, _, _, _,) = SquashedGaussianActorGraph(S_, reuse=True, seeds=ga_seeds)
+        # (lya_a_, _, _, _,) = SquashedGaussianActorGraph(S_, reuse=True)
         lya_l_ = LyapunovCriticGraph(S_, lya_a_, reuse=True, seed=lc_seed)
 
         ###########################################

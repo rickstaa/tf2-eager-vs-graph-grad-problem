@@ -12,13 +12,6 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-# Disable GPU if requested
-# NOTE: Done so i can run both scripts in a debugger side by side
-tf.config.set_visible_devices([], "GPU")
-
-# Disable eager
-tf.compat.v1.disable_eager_execution()
-
 ####################################################
 # Script parameters ################################
 ####################################################
@@ -52,14 +45,19 @@ RANDOM_SEED = 0  # The random seed
 # Set random seed to get comparable results for each run
 # NOTE: https://stackoverflow.com/questions/32419510/how-to-get-reproducible-results-in-keras
 if RANDOM_SEED is not None:
-
-    # Set random seeds
     os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # new flag present in tf 2.0+
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     tf.random.set_seed(RANDOM_SEED)
     TFP_SEED_STREAM = tfp.util.SeedStream(RANDOM_SEED, salt="tfp_1")
+
+# Disable GPU if requested
+# NOTE: Done so i can run both scripts in a debugger side by side
+tf.config.set_visible_devices([], "GPU")
+
+# Disable eager
+tf.compat.v1.disable_eager_execution()
 
 
 ####################################################
@@ -247,7 +245,7 @@ class LAC(object):
             )
 
             # Create EMA target network update policy (Soft replacement)
-            ema = tf.train.ExponentialMovingAverage(decay=(self.polyak))
+            ema = tf.train.ExponentialMovingAverage(decay=self.polyak)
 
             def ema_getter(getter, name, *args, **kwargs):
                 return ema.average(getter(name, *args, **kwargs))
@@ -286,7 +284,7 @@ class LAC(object):
                 self.lya_deterministic_a_,
                 self.lya_a_dist_,
                 self.lya_epsilon_,
-            ) = self._build_a(self.S_, reuse=True, seeds=self.lya_ga_target_seeds)
+            ) = self._build_a(self.S_, reuse=True, seeds=self.ga_seeds)
             self.lya_log_pis_ = self.lya_a_dist_.log_prob(
                 self.lya_a_
             )  # Gaussian actor action log_probability

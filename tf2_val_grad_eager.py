@@ -486,7 +486,12 @@ if __name__ == "__main__":
 
     # Perform forward pass through networks to retrieve required loss parameters
     l = lc([batch["s"], batch["a"]])
-    lya_l_ = lc([batch["s_"], lya_ga_(batch["s_"])[0]])
+    lya_l_ = lc(
+        [batch["s_"], lya_ga_(batch["s_"])[0]]
+    )  # NOTE: this is needed to achieve deterministic outputs
+    # lya_l_ = lc(
+    #     [batch["s_"], ga(batch["s_"])[0]]
+    # )  # NOTE: This is what it should be if I compare it with the original graph
 
     # Compute Lyapunov difference
     # NOTE: This is similar to the Q backup (Q_- Q + alpha * R) but now while the agent
