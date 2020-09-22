@@ -11,6 +11,8 @@ import random
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow.python import debug as tf_debug
+from tensorflow.compat.v1.keras import backend as K
 
 # Disable GPU if requested
 # NOTE: Done so i can run both scripts in a debugger side by side
@@ -53,12 +55,19 @@ RANDOM_SEED = 0  # The random seed
 if RANDOM_SEED is not None:
 
     # Set random seeds
+    # tf.compat.v1.reset_default_graph()
     os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # new flag present in tf 2.0+
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
+    # tf.compat.v1.set_random_seed(RANDOM_SEED)
     tf.random.set_seed(RANDOM_SEED)
     TFP_SEED_STREAM = tfp.util.SeedStream(RANDOM_SEED, salt="tfp_1")
+
+    # Configure a new global `tensorflow` session
+    # session_conf = tf.compat.v1.ConfigProto(
+    #     intra_op_parallelism_threads=1, inter_op_parallelism_threads=1
+    # )
 
 
 ####################################################
@@ -355,7 +364,12 @@ if __name__ == "__main__":
     lc_target_seed = RANDOM_SEED + 3  # Weight init seed
 
     # Create tensorflow session
-    sess = tf.compat.v1.Session()
+    sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph())
+    # sess = tf.compat.v1.Session(
+    #     graph=tf.compat.v1.get_default_graph(), config=session_conf
+    # )
+    # K.set_session(sess)
+    # sess = tf_debug.TensorBoardDebugWrapperSession(sess, "localhost:7000")
 
     ###########################################
     # Create graphs ###########################
@@ -428,11 +442,7 @@ if __name__ == "__main__":
         # DEBUG: This graph has the same parameters as the original gaussian actor
         # but now it receives the next state. This was needed as the target network
         # uses exponential moving average.
-        # (lya_a_, _, _, _,) = SquashedGaussianActorGraph(
-        #     S_, reuse=True, seeds=lya_ga_target_seeds
-        # )
         (lya_a_, _, _, _,) = SquashedGaussianActorGraph(S_, reuse=True, seeds=ga_seeds)
-        # (lya_a_, _, _, _,) = SquashedGaussianActorGraph(S_, reuse=True)
         lya_l_ = LyapunovCriticGraph(S_, lya_a_, reuse=True, seed=lc_seed)
 
         ###########################################
@@ -441,8 +451,6 @@ if __name__ == "__main__":
 
         # Lyapunov constraint function
         l_delta = tf.reduce_mean(input_tensor=(lya_l_ - l + ALPHA_3 * R))
-
-        # Create optimizers
 
         # Actor optimizer graph
         a_loss = labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
@@ -472,7 +480,7 @@ if __name__ == "__main__":
     # Retrieve weights and create dummy batch #
     ###########################################
 
-    # Retrieve initial network weights
+    # # Retrieve initial network weights
     (
         ga_weights_biases,
         ga_target_weights_biases,
@@ -513,9 +521,15 @@ if __name__ == "__main__":
 
     # Compute actor loss
     # NOTE: Scale by factor to make effects more prevalent.
+    # a_loss = GRAD_SCALE_FACTOR * (
+    #     labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
+    # )
+    # a_loss = GRAD_SCALE_FACTOR * (
+    #     labda * l_delta + alpha * tf.stop_gradient(tf.reduce_mean(input_tensor=log_pis))
+    # )  # DEBUG
     a_loss = GRAD_SCALE_FACTOR * (
-        labda * l_delta + alpha * tf.reduce_mean(input_tensor=log_pis)
-    )
+        labda * l_delta + alpha * tf.stop_gradient(tf.reduce_mean(input_tensor=log_pis))
+    )  # DEBUG
 
     # Create diagnostics retrieval graph
     a_diagnostics = [

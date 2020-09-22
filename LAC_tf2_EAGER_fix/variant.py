@@ -8,6 +8,16 @@ import time
 # Computational settings
 USE_GPU = False
 
+# Debug Parameters
+DEBUG_PARAMS = {
+    "debug": False,  # Whether we want to debug and thus execute tf.functions eagerly
+    "trace_net": False,  # Whether we want to trace the network.
+    "trace_learn": False,  # Whether we want trace the learn method.
+    "use_tb": False,  # Whether you want to log to tensorboard
+    "tb_freq": 4,  # After how many episode we want to log to tensorboard
+    "write_w_b": False,  # Whether you want to log the model weights and biases
+}
+
 # Environment parameters
 ENV_NAME = "Ex3_EKF"  # The gym environment you want to train in
 ENV_SEED = 0  # The environment seed
@@ -33,7 +43,7 @@ TRAIN_PARAMS = {
 
 # Main evaluation parameters
 EVAL_PARAMS = {
-    "eval_list": ["LAC20200906_2152"],
+    "eval_list": ["LAC20200910_2211"],
     "additional_description": timestr,
     "trials_for_eval": [str(i) for i in range(0, 3)],
     "num_of_paths": 10,  # number of path for evaluation

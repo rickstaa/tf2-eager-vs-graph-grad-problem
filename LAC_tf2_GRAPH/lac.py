@@ -9,11 +9,13 @@ import random
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow.python import debug as tf_debug
 
 from squash_bijector import SquashBijector
 from utils import evaluate_training_rollouts, get_env_from_name, training_evaluation
 import logger
 from pool import Pool
+
 
 ###############################################
 # Script settings #############################
@@ -101,6 +103,7 @@ class LAC(object):
 
         # Create tensorflow session
         self.sess = tf.compat.v1.Session()
+        # self.sess = tf_debug.TensorBoardDebugWrapperSession(self.sess, "localhost:6006")
 
         # Create networks, optimizers and variables inside the Actor scope
         with tf.compat.v1.variable_scope("Actor"):

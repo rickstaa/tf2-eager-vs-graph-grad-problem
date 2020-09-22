@@ -11,6 +11,7 @@ import random
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow.compat.v1.keras import backend as K
 
 # Disable GPU if requested
 # NOTE: Done so i can run both scripts in a debugger side by side
@@ -18,6 +19,10 @@ tf.config.set_visible_devices([], "GPU")
 
 # USED FOR DEBUGGING
 tf.config.experimental_run_functions_eagerly(True)
+
+# Set threading options
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
 
 ####################################################
 # Script parameters ################################
@@ -46,19 +51,31 @@ GRAD_SCALE_FACTOR = 500  # Scale the grads by a factor to make differences more 
 ####################################################
 # Seed random number generators ####################
 ####################################################
-RANDOM_SEED = 0  # The random seed
+RANDOM_SEED = 22  # The random seed
 
 # Set random seed to get comparable results for each run
 # NOTE: https://stackoverflow.com/questions/32419510/how-to-get-reproducible-results-in-keras
 if RANDOM_SEED is not None:
 
     # Set random seeds
+    # tf.compat.v1.reset_default_graph()
     os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
     os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # new flag present in tf 2.0+
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
+    # tf.compat.v1.set_random_seed(RANDOM_SEED)
     tf.random.set_seed(RANDOM_SEED)
     TFP_SEED_STREAM = tfp.util.SeedStream(RANDOM_SEED, salt="tfp_1")
+
+    # Configure a new global `tensorflow` session
+    # session_conf = tf.compat.v1.ConfigProto(
+    #     intra_op_parallelism_threads=1, inter_op_parallelism_threads=1
+    # )
+    # K.set_session(
+    #     tf.compat.v1.Session(
+    #         graph=tf.compat.v1.get_default_graph(), config=session_conf
+    #     )
+    # )
 
 # Used to be able to debug graph functions
 tf.config.experimental_run_functions_eagerly(True)
@@ -148,7 +165,7 @@ def retrieve_weights_biases(ga, ga_, lc, lc_):
 
 
 ####################################################
-# Used network Calsses #############################
+# Used network Classes #############################
 ####################################################
 class SquashedGaussianActor(tf.keras.Model):
     def __init__(
@@ -436,17 +453,18 @@ if __name__ == "__main__":
     # NOTE: In eager mode this actor could have been omitted but since graph mode makes
     # a seperate graph for this computation we need to include it here to have the same
     # random seed sequence.
-    lya_ga_ = SquashedGaussianActor(
-        obs_dim=S_DIM,
-        act_dim=A_DIM,
-        hidden_sizes=NETWORK_STRUCTURE["actor"],
-        name="gaussian_actor",
-        seeds=lya_ga_target_seeds,
-    )
-    # Initializing extra Gaussian actor weights/biases to match those of the main
-    # Gaussian actor
-    for pi_main, pi_targ in zip(ga.variables, lya_ga_.variables):
-        pi_targ.assign(pi_main)
+    # lya_ga_ = SquashedGaussianActor(
+    #     obs_dim=S_DIM,
+    #     act_dim=A_DIM,
+    #     hidden_sizes=NETWORK_STRUCTURE["actor"],
+    #     name="gaussian_actor",
+    #     seeds=lya_ga_target_seeds,
+    # )
+
+    # # Initializing extra Gaussian actor weights/biases to match those of the main
+    # # Gaussian actor
+    # for pi_main, pi_targ in zip(ga.variables, lya_ga_.variables):
+    #     pi_targ.assign(pi_main)
 
     ###########################################
     # Retrieve weights and create dummy batch #
@@ -484,31 +502,41 @@ if __name__ == "__main__":
     # Validate actor grads #########################
     ################################################
 
-    # Perform forward pass through networks to retrieve required loss parameters
+    # Calculate l
     l = lc([batch["s"], batch["a"]])
-    lya_l_ = lc(
-        [batch["s_"], lya_ga_(batch["s_"])[0]]
-    )  # NOTE: this is needed to achieve deterministic outputs
     # lya_l_ = lc(
-    #     [batch["s_"], ga(batch["s_"])[0]]
-    # )  # NOTE: This is what it should be if I compare it with the original graph
+    #     [batch["s_"], lya_ga_(batch["s_"])[0]]
+    # )  # NOTE: this is needed to achieve deterministic outputs
 
     # Compute Lyapunov difference
     # NOTE: This is similar to the Q backup (Q_- Q + alpha * R) but now while the agent
     # tries to satisfy the the lyapunov stability constraint.
-    l_delta = tf.reduce_mean(lya_l_ - l + ALPHA_3 * batch["r"])
 
     # Actor loss and optimizer graph
     with tf.GradientTape() as tape:
+
+        # Perform forward pass through networks to retrieve required loss parameters
+        lya_a_, _, _, _ = ga(batch["s_"])
+        lya_l_ = lc(
+            [batch["s_"], lya_a_]
+        )  # NOTE: This is what it should be if I compare it with the original graph
+
+        # Caclulate l_delta
+        l_delta = tf.reduce_mean(lya_l_ - l + ALPHA_3 * batch["r"])
 
         # Calculate log probability of a_input based on current policy
         _, _, log_pis, _ = ga(batch["s"])
 
         # Compute a_loss (Increase to make effects more prevalent)
-        a_loss = GRAD_SCALE_FACTOR * (
-            tf.stop_gradient(labda) * l_delta
-            + tf.stop_gradient(alpha) * tf.reduce_mean(log_pis)
-        )
+        # a_loss = GRAD_SCALE_FACTOR * (
+        #     tf.stop_gradient(labda) * l_delta
+        #     + tf.stop_gradient(alpha) * tf.reduce_mean(log_pis)
+        # )
+        # a_loss = GRAD_SCALE_FACTOR * (
+        #     tf.stop_gradient(labda) * l_delta
+        #     + tf.stop_gradient(alpha) * tf.stop_gradient(tf.reduce_mean(log_pis))
+        # ) # DEBUG
+        a_loss = GRAD_SCALE_FACTOR * (tf.stop_gradient(labda) * l_delta)  # DEBUG
 
     # Compute gradients
     a_grads = tape.gradient(a_loss, ga.trainable_variables)

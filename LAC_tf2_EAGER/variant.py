@@ -13,6 +13,9 @@ DEBUG_PARAMS = {
     "debug": True,  # Whether we want to debug and thus execute tf.functions eagerly
     "trace_net": False,  # Whether we want to trace the network.
     "trace_learn": False,  # Whether we want trace the learn method.
+    "use_tb": False,  # Wheter you want to log to tensorboard
+    "tb_freq": 4,  # After how many episode we want to log to tensorboard
+    "write_w_b": False,  # Whether you want to log the model weights and biases
 }
 
 # Environment parameters

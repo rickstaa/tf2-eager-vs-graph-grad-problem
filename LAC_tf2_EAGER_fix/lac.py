@@ -21,6 +21,7 @@ from pool import Pool
 # Script settings #############################
 ###############################################
 from variant import (
+    LOG_PATH,
     USE_GPU,
     ENV_NAME,
     RANDOM_SEED,
@@ -42,17 +43,17 @@ if RANDOM_SEED is not None:
     tf.random.set_seed(RANDOM_SEED)
     TFP_SEED_STREAM = tfp.util.SeedStream(RANDOM_SEED, salt="tfp_1")
 
+
+###############################################
+# Debug options ###############################
+###############################################
+
 # Check if eager mode is enabled
 print("Tensorflow eager mode enabled: " + str(tf.executing_eagerly()))
 
 # Disable GPU if requested
 if not USE_GPU:
     tf.config.set_visible_devices([], "GPU")
-
-# Tensorboard settings
-USE_TB = True  # Whether you want to log to tensorboard
-TB_FREQ = 4  # After how many episode we want to log to tensorboard
-WRITE_W_B = False  # Whether you want to log the model weights and biases
 
 # Disable tf.function graph execution if debug
 if DEBUG_PARAMS["debug"] and not (
@@ -64,6 +65,15 @@ if DEBUG_PARAMS["debug"] and not (
         "deployment."
     )  # TODO: MAke warning
     tf.config.experimental_run_functions_eagerly(True)
+
+# Check for numeric errors
+# tf.debugging.enable_check_numerics()
+
+# # Enable tf2 tb debugger
+# NOTE: I did not yet get this to work in eager mode
+# tf.debugging.experimental.enable_dump_debug_info(
+#     LOG_PATH, tensor_debug_mode="FULL_HEALTH", circular_buffer_size=-1
+# )
 
 
 ###############################################
@@ -138,7 +148,7 @@ class LAC(object):
         self.target_init()
 
         # Create summary writer
-        if USE_TB:
+        if DEBUG_PARAMS["use_tb"]:
             self.step = 0
             self.tb_writer = tf.summary.create_file_writer(log_dir)
 
@@ -157,7 +167,7 @@ class LAC(object):
         ###########################################
         # Trace networks (DEBUGGING) ##############
         ###########################################
-        if USE_TB:
+        if DEBUG_PARAMS["use_tb"]:
             if DEBUG_PARAMS["debug"]:
                 if DEBUG_PARAMS["trace_net"]:
 
@@ -232,67 +242,16 @@ class LAC(object):
         bterminal = batch["terminal"]
         bs_ = batch["s_"]  # next state
 
-        # Calculate current value and target lyapunov multiplier value
-        lya_a_, _, _ = self.ga(bs_)
-        lya_l_ = self.lc([bs_, lya_a_])
-
-        # Calculate current lyapunov value
-        l = self.lc([bs, ba])
-
-        # # Calculate Lyapunov constraint function
-        self.l_delta = tf.reduce_mean(lya_l_ - l + (ALG_PARAMS["alpha3"]) * br)
-
-        # Lagrance multiplier loss functions and optimizers graphs
-        with tf.GradientTape() as tape:
-            labda_loss = -tf.reduce_mean(self.log_labda * self.l_delta)
-
-        # Apply gradients
-        lambda_grads = tape.gradient(labda_loss, [self.log_labda])
-        self.lambda_train.apply_gradients(zip(lambda_grads, [self.log_labda]))
-
-        # Calculate log probability of a_input based on current policy
-        _, _, log_pis = self.ga(bs)
-
-        # Calculate alpha loss
-        with tf.GradientTape() as tape:
-            alpha_loss = -tf.reduce_mean(
-                self.log_alpha * tf.stop_gradient(log_pis + self.target_entropy)
-            )
-
-        # Apply gradients
-        alpha_grads = tape.gradient(alpha_loss, [self.log_alpha])
-        self.alpha_train.apply_gradients(zip(alpha_grads, [self.log_alpha]))
-
-        # Calculate Lyapunov constraint function
-        self.l_delta = tf.reduce_mean(lya_l_ - l + (ALG_PARAMS["alpha3"]) * br)
-
-        # Actor loss and optimizer graph
-        with tf.GradientTape() as tape:
-
-            # Calculate log probability of a_input based on current policy
-            _, _, log_pis = self.ga(bs)
-
-            # Calculate actor loss
-            # TODO: VAliate whether tf.stop_gradient() is needed
-            # a_loss = self.labda * self.l_delta + self.alpha * tf.reduce_mean(log_pis)
-            a_loss = tf.stop_gradient(self.labda) * tf.stop_gradient(
-                self.l_delta
-            ) + tf.stop_gradient(self.alpha) * tf.reduce_mean(log_pis)
-
-        # Apply gradients
-        a_grads = tape.gradient(a_loss, self.ga.trainable_variables)
-        self.a_train.apply_gradients(zip(a_grads, self.ga.trainable_variables))
-
         # Update target networks
         self.update_target()
 
-        # Get Lypaunov target
+        # Get Lyapunov target
         a_, _, _ = self.ga_(bs_)
         l_ = self.lc_([bs_, a_])
         l_target = br + ALG_PARAMS["gamma"] * (1 - bterminal) * tf.stop_gradient(l_)
 
         # Lyapunov candidate constraint function graph
-        with tf.GradientTape() as tape:
+        with tf.GradientTape() as l_tape:
 
             # Calculate current lyapunov value
             l = self.lc([bs, ba])
@@ -302,8 +261,46 @@ class LAC(object):
                 labels=l_target, predictions=l
             )
 
-        # Apply gradients
-        l_grads = tape.gradient(l_error, self.lc.trainable_variables)
+        # Actor loss and optimizer graph
+        with tf.GradientTape() as a_tape:
+
+            # Calculate current value and target lyapunov multiplier value
+            lya_a_, _, _ = self.ga(bs_)
+            lya_l_ = self.lc([bs_, lya_a_])
+
+            # Calculate Lyapunov constraint function
+            self.l_delta = tf.reduce_mean(lya_l_ - l + (ALG_PARAMS["alpha3"]) * br)
+
+            # Calculate log probability of a_input based on current policy
+            _, _, log_pis = self.ga(bs)
+
+            # Calculate actor loss
+            a_loss = self.labda * self.l_delta + self.alpha * tf.reduce_mean(log_pis)
+
+        # Lagrance multiplier loss functions and optimizers graphs
+        with tf.GradientTape() as lambda_tape:
+            labda_loss = -tf.reduce_mean(self.log_labda * self.l_delta)
+
+        # Calculate alpha loss
+        with tf.GradientTape() as alpha_tape:
+            alpha_loss = -tf.reduce_mean(
+                self.log_alpha * tf.stop_gradient(log_pis + self.target_entropy)
+            )  # Trim down
+
+        # Apply lambda gradients
+        lambda_grads = lambda_tape.gradient(labda_loss, [self.log_labda])
+        self.lambda_train.apply_gradients(zip(lambda_grads, [self.log_labda]))
+
+        # Apply alpha gradients
+        alpha_grads = alpha_tape.gradient(alpha_loss, [self.log_alpha])
+        self.alpha_train.apply_gradients(zip(alpha_grads, [self.log_alpha]))
+
+        # Apply actor gradients
+        a_grads = a_tape.gradient(a_loss, self.ga.trainable_variables)
+        self.a_train.apply_gradients(zip(a_grads, self.ga.trainable_variables))
+
+        # Apply critic gradients
+        l_grads = l_tape.gradient(l_error, self.lc.trainable_variables)
         self.l_train.apply_gradients(zip(l_grads, self.lc.trainable_variables))
 
         # Return results
@@ -479,7 +476,7 @@ def train(log_dir):
     training_started = False
 
     # Log initial values to tensorboard
-    if USE_TB:
+    if DEBUG_PARAMS["use_tb"]:
 
         # Trace learn method (Used for debugging)
         if DEBUG_PARAMS["debug"]:
@@ -574,7 +571,7 @@ def train(log_dir):
             # Increment tensorboard step counter
             # NOTE: This was done differently from the global_step counter since
             # otherwise there were inconsistencies in the tb log.
-            if USE_TB:
+            if DEBUG_PARAMS["use_tb"]:
                 policy.step += 1
 
             # Store experience in replay buffer
@@ -653,14 +650,14 @@ def train(log_dir):
                     last_training_paths.appendleft(current_path)
 
                     # Get current model performance for tb
-                    if USE_TB:
+                    if DEBUG_PARAMS["use_tb"]:
                         training_diagnostics = evaluate_training_rollouts(
                             last_training_paths
                         )
 
                 # Log tb variables
-                if USE_TB:
-                    if i % TB_FREQ == 0:
+                if DEBUG_PARAMS["use_tb"]:
+                    if i % DEBUG_PARAMS["tb_freq"] == 0:
 
                         # Log learning rate to tb
                         with policy.tb_writer.as_default():
@@ -700,7 +697,7 @@ def train(log_dir):
                                 )
 
                             # Log network weights
-                            if WRITE_W_B:
+                            if DEBUG_PARAMS["write_w_b"]:
                                 with policy.tb_writer.as_default():
 
                                     # GaussianActor weights/biases
